@@ -1,0 +1,116 @@
+import torch
+import torch.nn as nn
+import numpy as np
+from einops import rearrange, repeat
+from torchsummary import summary
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, embedding_dim, head_num):
+        super().__init__()
+        self.head_num = head_num
+        self.dk = (embedding_dim // head_num) ** (1 / 2)  # 防止梯度消失
+        self.qkv_layer = nn.Linear(embedding_dim, embedding_dim * 3, bias=False)  # 获取qkv
+        self.out_attention = nn.Linear(embedding_dim, embedding_dim, bias=False)
+
+    def forward(self, x, mask=None):
+        qkv = self.qkv_layer(x)
+
+        query, key, value = tuple(rearrange(qkv, 'b t (d k h ) -> k b h t d ', k=3, h=self.head_num))
+        # h:头数,t:序列长度,d:每个头的维度
+        energy = torch.einsum("... i d , ... j d -> ... i j", query, key) * self.dk
+
+        if mask is not None:
+            energy = energy.masked_fill(mask, -np.inf)
+            #  mask 通常用于屏蔽一些无效或不需要关注的位置，例如在序列数据中的填充位置或未来信息。在进行 softmax 操作时，这些位置的权重将趋近于零
+        attention = torch.softmax(energy, dim=-1)
+        x = torch.einsum("... i j , ... j d -> ... i d", attention, value)  # 爱因斯坦求和:sum(A_(i,j)B_(j,d))
+        x = rearrange(x, "b h t d -> b t (h d)")
+        x = self.out_attention(x)  # softmax(qK/sqrt(dk))*V
+        return x
+
+
+class MLP(nn.Module):
+    def __init__(self, embedding_dim, mlp_dim):
+        super().__init__()
+        self.mlp_layers = nn.Sequential(
+            nn.Linear(embedding_dim, mlp_dim),
+            nn.ELU(inplace=True),  # using ELU in original paper, ELU=x>0?exp(x)-1,x;
+            nn.Dropout(0.1),
+            nn.Linear(mlp_dim, embedding_dim),
+            nn.Dropout(0.1)
+        )
+
+    def forward(self, x):
+        x = self.mlp_layers(x)
+        return x
+
+
+class TransformerEncoderBlock(nn.Module):
+    def __init__(self, embedding_dim, head_num, mlp_dim):
+        super().__init__()
+        self.multi_head_attention = MultiHeadAttention(embedding_dim, head_num)
+        self.mlp = MLP(embedding_dim, mlp_dim)
+        self.layer_norm1 = nn.LayerNorm(embedding_dim)
+        self.layer_norm2 = nn.LayerNorm(embedding_dim)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+        _x = self.multi_head_attention(x)
+        _x = self.dropout(_x)
+        x = x + _x
+        x = self.layer_norm1(x)
+        _x = self.mlp(x)
+        x = x + _x
+        x = self.layer_norm2(x)
+        return x
+
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, embedding_dim, head_num, mlp_dim, block_num=12):
+        super().__init__()
+        self.layer_blocks = nn.ModuleList(
+            [TransformerEncoderBlock(embedding_dim, head_num, mlp_dim) for _ in range(block_num)])
+
+    def forward(self, x):
+        for layer_block in self.layer_blocks:
+            x = layer_block(x)
+        return x
+
+
+class ViT(nn.Module):
+    def __init__(self, img_dim, in_channels, embedding_dim, head_num, mlp_dim,
+                 block_num, patch_dim, classification=True, num_classes=1):
+        super().__init__()
+
+        self.patch_dim = patch_dim
+        self.classification = classification
+        self.num_tokens = (img_dim // patch_dim) ** 2
+        self.token_dim = in_channels * (patch_dim ** 2)
+        self.projection = nn.Linear(self.token_dim, embedding_dim)
+        self.embedding = nn.Parameter(torch.rand(self.num_tokens + 1, embedding_dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embedding_dim))
+        self.dropout = nn.Dropout(0.1)
+        self.transformer = TransformerEncoder(embedding_dim, head_num, mlp_dim, block_num)
+        if self.classification:
+            self.mlp_head = nn.Linear(embedding_dim, num_classes)
+
+    def forward(self, x):
+        img_patches = rearrange(x, 'b c (patch_x x) (patch_y y) -> b (x y) (patch_x patch_y c)', patch_x=self.patch_dim,
+                                patch_y=self.patch_dim)
+        batch_size, tokens, _ = img_patches.shape
+        project = self.projection(img_patches)  # tokens->patch embedding
+        # Patch Embedding 是将图像补丁转换为固定维度的向量表示，用于编码图像的局部信息；
+        # Position Embedding 是用于编码图像补丁的位置信息，从而实现对位置信息的建模
+        token = repeat(self.cls_token, 'b ... -> (b batch_size) ...', batch_size=batch_size)  # cls_token用于表示图像全局信息
+        patches = torch.cat([token, project], dim=1)
+        patches += self.embedding[:tokens + 1, :]  # patches的维度中有batch_size，而编码中没有，不能直接相加
+        x = self.dropout(patches)
+        x = self.transformer(x)
+        x = self.mlp_head(x[:, 0, :]) if self.classification else x[:, 1:, :]
+        return x
+
+
+if __name__ == '__main__':
+    vit = ViT(img_dim=240, in_channels=3, patch_dim=16, embedding_dim=512, block_num=6, head_num=8, mlp_dim=1024)
+    summary(vit, input_size=(3, 240, 240))
